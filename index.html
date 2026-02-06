@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="robots" content="noindex,nofollow" />
+  <title>自分用 口調変換</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; margin: 16px; line-height: 1.6; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    textarea { width: 100%; min-height: 140px; padding: 10px; }
+    button, select { padding: 10px 12px; }
+    .box { margin-top: 12px; }
+    .small { font-size: 12px; opacity: .75; }
+    pre { white-space: pre-wrap; word-break: break-word; padding: 10px; background: #f6f6f6; }
+  </style>
+</head>
+<body>
+  <h1>自分用 口調変換</h1>
+
+  <div class="row">
+    <label>プリセット：
+      <select id="preset">
+        <option value="unta">うんた</option>
+        <option value="bebi">ベビ</option>
+      </select>
+    </label>
+
+    <button id="convertBtn">変換</button>
+    <button id="copyBtn">出力をコピー</button>
+  </div>
+
+  <div class="box">
+    <div class="small">入力</div>
+    <textarea id="input" placeholder="ここに文章"></textarea>
+  </div>
+
+  <div class="box">
+    <div class="small">出力</div>
+    <pre id="output"></pre>
+  </div>
+
+  <div class="box small" id="status">辞書ロード待ち…（dict が必要）</div>
+
+  <!-- kuromoji.js -->
+  <script src="https://unpkg.com/kuromoji@0.1.2/dist/kuromoji.js"></script>
+
+  <script>
+    // ========= ルール（最新版ベース） =========
+
+    // 固定辞書（単語）
+    const WORD_REPLACE = new Map([
+      ["これ", "こりぇ"],
+      ["おいしい", "おいちい"],
+      ["うれしい", "うれちい"],
+      ["うれしかった", "うれちかった"],
+      // 必要に応じて追加
+    ]);
+
+    // 正規表現系（まずは安全なやつだけ）
+    const REGEX_REPLACE = [
+      // ってる / てる → ってりゅ / てりゅ
+      [/(って)る/g, "$1りゅ"],
+      [/(て)る/g, "$1りゅ"],
+
+      // られ → りぇ （食べられない→食べりぇない）
+      [/られ/g, "りぇ"],
+    ];
+
+    // 「崩さない動詞」：行く・来る・出る・空く など（ユーザー方針）
+    const VERB_BLOCKLIST_BASE = new Set(["行く", "来る", "出る", "空く", "向かう"]);
+
+    // 「名詞＋した」→「名詞＋ちた」にしたい対象（感情・状態名詞）
+    // ※ここは増やしていく（安心/緊張/満足…）
+    const NOUN_CHITA_ALLOW = new Set(["安心", "緊張", "満足", "納得"]);
+
+    // 「助かった」→「助かっちゃ」
+    function applyTasuka(t) {
+      return t.replace(/助かった/g, "助かっちゃ");
+    }
+
+    // スペース挿入（雑に「トークン間」を空ける。あとで調整可）
+    // 例外：記号の前後は詰める、など最低限。
+    function joinWithSpaces(tokens) {
+      let out = "";
+      for (let i = 0; i < tokens.length; i++) {
+        const s = tokens[i];
+        if (!s) continue;
+        // 記号は前にスペースを入れない
+        if (/^[、。！？…]+$/.test(s)) {
+          out = out.trimEnd() + s;
+          continue;
+        }
+        // それ以外はスペース区切り
+        if (out.length === 0) out = s;
+        else out += " " + s;
+      }
+      return out;
+    }
+
+    // ========= kuromoji 初期化 =========
+    let tokenizer = null;
+
+    // dict は自前配置が必要
+    // 例：同じフォルダに dict/ を置く（後述）
+    kuromoji.builder({ dicPath: "dict/" }).build((err, tk) => {
+      const status = document.getElementById("status");
+      if (err) {
+        status.textContent = "辞書ロード失敗：dict/ が見つからないかも（下の手順で配置してね）";
+        console.error(err);
+        return;
+      }
+      tokenizer = tk;
+      status.textContent = "準備OK（辞書ロード完了）";
+    });
+
+    // ========= 変換本体 =========
+    function convertText(text, preset) {
+      // 0) まず全体で安全な置換（助かった→助かっちゃ など）
+      let t = applyTasuka(text);
+
+      // 1) 固定辞書置換（長い順にしたいなら後で並べ替え）
+      for (const [from, to] of WORD_REPLACE.entries()) {
+        t = t.split(from).join(to);
+      }
+
+      // 2) 正規表現置換
+      for (const [re, rep] of REGEX_REPLACE) {
+        t = t.replace(re, rep);
+      }
+
+      // 3) kuromojiがあるならトークン処理（動詞の る→りゅ、名詞＋ちた など）
+      if (!tokenizer) {
+        // tokenizer無いときは最低限返す
+        return t;
+      }
+
+      const toks = tokenizer.tokenize(t);
+
+      // 出力用の表層形配列
+      const out = [];
+      for (let i = 0; i < toks.length; i++) {
+        const tok = toks[i];
+
+        let s = tok.surface_form;
+
+        // 一人称は「自動付与しない」方針なので、ここでは何もしない
+        // presetは将来、入力内の「私/僕/俺」置換などに使える
+
+        // 名詞＋した → 名詞＋ちた（感情・状態名詞のみ）
+        // パターン： [名詞(安心/緊張/満足...)] [した]
+        if (tok.pos === "名詞" && NOUN_CHITA_ALLOW.has(tok.surface_form)) {
+          const next = toks[i + 1];
+          if (next && next.surface_form === "した") {
+            out.push(tok.surface_form + "ちた");
+            i += 1; // 次（した）を消費
+            continue;
+          }
+        }
+
+        // 動詞の基本形が「〜る」なら末尾だけ「りゅ」(ただしブロックリスト除外)
+        // 例：帰る→帰りゅ / 寝る→寝りゅ
+        if (tok.pos === "動詞") {
+          const base = tok.basic_form; // 例：帰る
+          if (base && base.endsWith("る") && !VERB_BLOCKLIST_BASE.has(base)) {
+            // 表層形の末尾が「る」なら置換（活用形が違う場合は触らない）
+            if (s.endsWith("る")) {
+              s = s.slice(0, -1) + "りゅ";
+            }
+          }
+        }
+
+        out.push(s);
+      }
+
+      return joinWithSpaces(out);
+    }
+
+    // ========= UI =========
+    const $ = (id) => document.getElementById(id);
+
+    $("convertBtn").addEventListener("click", () => {
+      const input = $("input").value || "";
+      const preset = $("preset").value;
+      $("output").textContent = convertText(input, preset);
+    });
+
+    $("copyBtn").addEventListener("click", async () => {
+      const text = $("output").textContent || "";
+      try {
+        await navigator.clipboard.writeText(text);
+        $("status").textContent = "コピーしたよ";
+      } catch (e) {
+        $("status").textContent = "コピー失敗（iOSだと権限が必要なことある）";
+      }
+    });
+  </script>
+
+  <hr />
+  <div class="small">
+    <b>dict の置き方</b><br>
+    kuromoji.js は辞書ファイルが必要。<br>
+    このHTMLと同じ場所に <code>dict/</code> フォルダを作って、中に辞書を入れてね。<br>
+    例：<code>dict/base.dat.gz</code> など一式。<br>
+    （GitHub Pagesに置くなら、そのままリポジトリに <code>dict/</code> を入れる）
+  </div>
+</body>
+</html>
